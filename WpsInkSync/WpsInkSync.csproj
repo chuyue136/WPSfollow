@@ -13,6 +13,12 @@
     <SatelliteResourceLanguages>zh-Hans;en</SatelliteResourceLanguages>
   </PropertyGroup>
 
+  <!-- 发布包不带 pdb（icpx 是整个输出目录打包，pdb 占了三分之二体积） -->
+  <PropertyGroup Condition="'$(Configuration)'=='Release'">
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+  </PropertyGroup>
+
   <ItemGroup>
     <PackageReference Include="InkCanvas.PluginSdk" Version="1.8.0.8-g90c1bad8f3">
       <ExcludeAssets>runtime</ExcludeAssets>

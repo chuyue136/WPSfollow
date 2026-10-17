@@ -2,11 +2,11 @@
   "Id": "com.yg.wpsinksync",
   "Name": "WPS 墨迹同步",
   "Version": "0.1.0",
-  "Description": "WPS 文档滚动时同步平移批注笔迹",
-  "Author": "YG",
+  "Description": "在 ICC CE 浮动栏翻页，WPS 文档滚动时同步平移批注笔迹",
+  "Author": "chuyue136",
   "EntranceAssembly": "WpsInkSync.dll",
   "ApiVersion": "1.0.0",
   "MinHostVersion": "1.8.0.0",
-  "License": "GPL-3.0",
-  "Tags": [ "wps", "ink" ]
+  "License": "MIT",
+  "Tags": [ "wps", "ink", "sync" ]
 }

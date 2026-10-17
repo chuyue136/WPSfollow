@@ -3,6 +3,8 @@
 在 [InkCanvasForClass CE](https://github.com/InkCanvasForClass/InkCanvasForClass) 的浮动工具栏里加一排翻页按钮：
 按一下让 WPS 滚 N 格，同时把画布上的批注笔迹按**同样的像素**平移。讲课时页面和墨迹永远对齐。
 
+> 下载：见 [Releases](https://github.com/chuyue136/WPSfollow/releases)（`WpsInkSync.icpx`，丢进 ICC 的 `Plugins\com.yg.wpsinksync\` 即可）。
+
 - 只跟**插件自己发的滚动**：鼠标滚轮、手型拖动、拖滚动条一律不动笔迹（避免抓帧量不准把墨迹推歪）。
 - 每格像素自学习：PDF 300% ≈ 60px、docx 200% ≈ 87px，换文档/改缩放后头一两下自动校准。
 - 支持 WPS PDF（窗口类 `Qt5*`）与 .docx（`OpusApp`）。其它软件不动。
