@@ -1,0 +1,18 @@
+# 构建产物
+bin/
+obj/
+*.icpx
+*.user
+
+# 调试截图 / 位图（本地测试留档，几百 MB）
+shots/
+*.bmp
+
+# 探针工具的可执行体（源码保留）
+tools/*.dll
+tools/*.exe
+tools/*.pdb
+
+# 部署日志
+PluginLogs/
+*.log

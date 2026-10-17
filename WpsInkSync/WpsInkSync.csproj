@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>WpsInkSync</AssemblyName>
+    <RootNamespace>WpsInkSync</RootNamespace>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <CreateIcpx>true</CreateIcpx>
+    <SatelliteResourceLanguages>zh-Hans;en</SatelliteResourceLanguages>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="InkCanvas.PluginSdk" Version="1.8.0.8-g90c1bad8f3">
+      <ExcludeAssets>runtime</ExcludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="manifest.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+  <!-- 抓帧+位移匹配是纯 GDI/托管代码，和 ScrollProbe 共用同一份源码，避免两份实现漂移 -->
+  <ItemGroup>
+    <Compile Include="..\tools\ScrollProbe\Capture.cs" Link="Capture.cs" />
+  </ItemGroup>
+
+  <!-- windows10 TFM 会把 24MB WinRT 投影带进输出，插件用不到（宿主也不需要），打包前删掉 -->
+  <Target Name="TrimWinRT" BeforeTargets="CreateIcpxPackage;CopyFilesToOutputDirectory">
+    <ItemGroup>
+      <_WinRtJunk Include="$(TargetDir)Microsoft.Windows.SDK.NET.dll;$(TargetDir)WinRT.Runtime.dll" />
+    </ItemGroup>
+    <Delete Files="@(_WinRtJunk)" />
+  </Target>
+
+</Project>
