@@ -102,6 +102,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\diag.ps1
 - **改缩放后**每格像素变了：`_stepPx` 会自学习回来，但缩放那一下墨迹不跟着缩放（带 scale 的矩阵跟随没做）。
 - 横向平移（`dx`）路径在，但 WPS 这版 PDF 视图不响应 `HWHEEL`，未实测。
 - 只认 WPS Writer / PDF（进程 `wps` / `wpspdf` / `wpp` / `et`，窗口类 `Qt5*` 或 `OpusApp`）。
+- 按钮图标的颜色跟着 ICC 工具栏底色走（深底浅字 / 浅底深字），ICC 切主题后 500ms 内自动改色；日志里是 `外观: 宿主底色浅 → 前景 深色`。
 
 ## 代码结构
 

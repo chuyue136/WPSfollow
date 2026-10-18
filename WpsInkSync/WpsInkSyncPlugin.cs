@@ -138,6 +138,8 @@ public sealed class WpsInkSyncPlugin : PluginBase
             }
             if (_status != null)
                 _status.Text = (_follower?.Status ?? "插件已停止") + " | " + _shift.Status;
+            // 系统/宿主换主题（浅色 ↔ 深色）时改前景色
+            if (_panel != null) ApplyTheme();
         };
         timer.Start();
     }
@@ -626,14 +628,78 @@ public sealed class WpsInkSyncPlugin : PluginBase
     const string IconReset = "M 12 4 A 8 8 0 1 1 8.6 5.2 M 12 2 L 12 6 L 16 6";
     const string IconPen = "M 4 20 L 8.6 18.8 L 19 8.4 A 2.2 2.2 0 0 0 15.8 5.2 L 5.2 15.4 Z";
 
-    // ICC 工具栏底色始终是深色，图标/文字固定用浅色（跟随主题反而会看不出）
-    static readonly Brush TileBrush = CreateTileBrush();
+    // 图标/文字颜色跟着宿主工具栏的底色走：深底用浅字，浅底用深字。
+    // 系统切浅色主题时 ICC 工具栏会变白，固定浅色前景就会白字白底看不见。
+    Brush _fg = CreateFg(LightFg);
+    Color _fgColor = LightFg;
+    bool _themeLogged;
+    readonly List<DependencyObject> _tint = new List<DependencyObject>();
 
-    static Brush CreateTileBrush()
+    static readonly Color LightFg = Color.FromRgb(0xF0, 0xF0, 0xF0);
+    static readonly Color DarkFg = Color.FromRgb(0x1F, 0x1F, 0x1F);
+
+    static Brush CreateFg(Color c)
     {
-        var b = new SolidColorBrush(Color.FromRgb(0xF0, 0xF0, 0xF0));
+        var b = new SolidColorBrush(c);
         b.Freeze();
         return b;
+    }
+
+    /// <summary>按宿主工具栏实际底色定前景色；拿不到就退回系统主题。</summary>
+    void ApplyTheme()
+    {
+        bool dark = HostDark();
+        var c = dark ? LightFg : DarkFg;
+        if (c == _fgColor && _themeLogged) return;
+        _themeLogged = true;
+        _fgColor = c;
+        _fg = CreateFg(c);
+        foreach (var o in _tint)
+        {
+            switch (o)
+            {
+                case TextBlock t: t.Foreground = _fg; break;
+                case System.Windows.Shapes.Shape s: s.Stroke = _fg; break;
+                case Button b: b.Foreground = _fg; break;
+            }
+        }
+        Log($"外观: 宿主底色{(dark ? "深" : "浅")} → 前景 {(dark ? "浅色" : "深色")} #{c.R:X2}{c.G:X2}{c.B:X2}");
+    }
+
+    bool HostDark()
+    {
+        // 从自己往上找第一个"不透明纯色背景"的祖先（宿主工具栏的胶囊底）
+        for (DependencyObject cur = _panel; cur != null; cur = VisualTreeHelper.GetParent(cur))
+        {
+            var col = SolidBg(cur);
+            if (col.HasValue) return Lum(col.Value) < 0.5;
+        }
+        return !SystemLight();
+    }
+
+    static Color? SolidBg(DependencyObject d)
+    {
+        switch (d)
+        {
+            case Panel p when p.Background is SolidColorBrush s && s.Color.A >= 200: return s.Color;
+            case Border b when b.Background is SolidColorBrush s && s.Color.A >= 200: return s.Color;
+            case Control c when c.Background is SolidColorBrush s && s.Color.A >= 200: return s.Color;
+            default: return null;
+        }
+    }
+
+    static double Lum(Color c) => (0.299 * c.R + 0.587 * c.G + 0.114 * c.B) / 255.0;
+
+    /// <summary>Windows"应用模式"是不是浅色（1=浅色）。</summary>
+    static bool SystemLight()
+    {
+        try
+        {
+            using (var k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(
+                @"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"))
+                return Convert.ToInt32(k?.GetValue("AppsUseLightTheme") ?? 0) == 1;
+        }
+        catch { return false; }
     }
 
     FrameworkElement BuildPanel()
@@ -666,8 +732,10 @@ public sealed class WpsInkSyncPlugin : PluginBase
             Text = _shift.Status,
             Margin = new Thickness(8, 0, 4, 0),
             VerticalAlignment = VerticalAlignment.Center,
-            FontSize = 11
+            FontSize = 11,
+            Foreground = _fg
         };
+        _tint.Add(_status);
         panel.Children.Add(reset);
         panel.Children.Add(stamp);
         panel.Children.Add(_status);
@@ -682,8 +750,9 @@ public sealed class WpsInkSyncPlugin : PluginBase
         panel.Loaded += (_, _) =>
         {
             Log($"工具栏视图 Loaded，visibility={panel.Visibility} 策略={ModeText(_uiMode)}");
+            ApplyTheme();  // 现在才挂到可视树上，祖先底色要等这一刻才摸得到
             // 宿主挂载后会把视图 Visibility 改回 Visible，等它这一轮布局做完再按策略收一次
-            panel.Dispatcher.BeginInvoke(new Action(ApplyUiMode),
+            panel.Dispatcher.BeginInvoke(new Action(() => { ApplyUiMode(); ApplyTheme(); }),
                 System.Windows.Threading.DispatcherPriority.Loaded);
         };
 
@@ -725,13 +794,13 @@ public sealed class WpsInkSyncPlugin : PluginBase
             HorizontalAlignment = HorizontalAlignment.Center,
             SnapsToDevicePixels = true,
             Margin = new Thickness(0, 0, 0, 1),
-            Stroke = TileBrush
+            Stroke = _fg
         };
         var text = new TextBlock
         {
             Text = label,
             FontSize = 10.5,
-            Foreground = TileBrush,
+            Foreground = _fg,
             HorizontalAlignment = HorizontalAlignment.Center,
             TextAlignment = TextAlignment.Center,
             LineHeight = 12
@@ -753,13 +822,17 @@ public sealed class WpsInkSyncPlugin : PluginBase
             VerticalContentAlignment = VerticalAlignment.Center,
             Padding = new Thickness(0),
             Margin = new Thickness(1, 0, 1, 0),
-            Foreground = TileBrush,
+            Foreground = _fg,
             Background = System.Windows.Media.Brushes.Transparent,
             BorderThickness = new Thickness(0),
             Cursor = System.Windows.Input.Cursors.Hand,
             ToolTip = tip,
             Style = (Style)null
         };
+
+        _tint.Add(icon);
+        _tint.Add(text);
+        _tint.Add(b);
 
         b.Click += (_, _) =>
         {

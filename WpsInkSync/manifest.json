@@ -1,7 +1,7 @@
 {
   "Id": "com.yg.wpsinksync",
   "Name": "WPS 墨迹同步",
-  "Version": "0.1.0",
+  "Version": "0.1.1",
   "Description": "在 ICC CE 浮动栏翻页，WPS 文档滚动时同步平移批注笔迹",
   "Author": "chuyue136",
   "EntranceAssembly": "WpsInkSync.dll",
