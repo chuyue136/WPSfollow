@@ -35,6 +35,7 @@
   <!-- 抓帧+位移匹配是纯 GDI/托管代码，和 ScrollProbe 共用同一份源码，避免两份实现漂移 -->
   <ItemGroup>
     <Compile Include="..\tools\ScrollProbe\Capture.cs" Link="Capture.cs" />
+    <Compile Include="..\tools\ScrollProbe\Units.cs" Link="Units.cs" />
   </ItemGroup>
 
   <!-- windows10 TFM 会把 24MB WinRT 投影带进输出，插件用不到（宿主也不需要），打包前删掉 -->

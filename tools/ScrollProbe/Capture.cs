@@ -38,7 +38,12 @@ internal static class Capture
     /// </summary>
     public static Img Grab(IntPtr hwnd, bool fromScreen, Img reuse = null)
     {
-        GetWindowRect(hwnd, out var r);
+        // PrintWindow 会往目标窗口的 UI 线程投递 WM_PRINT。两个线程同时抓同一个窗口时，
+        // WPS 的界面线程只会串行处理，后到的那个往往卡住好几秒（实测连按时整条跟随线程停摆）。
+        // 这里全局串行化，宁可排队也不要并发。
+        lock (GrabGate)
+        {
+            GetWindowRect(hwnd, out var r);
         var w = r.R - r.L; var h = r.B - r.T;
         var img = (reuse != null && reuse.W == w && reuse.H == h && reuse.Bgra != null && reuse.Bgra.Length == w * h * 4)
             ? reuse
@@ -71,7 +76,10 @@ internal static class Capture
         for (var i = 0; i < buf.Length; i += 4 * 97) sum += buf[i + 2];  // 采样 R 通道
         img.Mean = sum / (buf.Length / (4.0 * 97));
         return img;
+        }
     }
+
+    static readonly object GrabGate = new object();
 
     /// <summary>
     /// 行剖面：每行在 [x0,x1) 内的「暗像素个数」。

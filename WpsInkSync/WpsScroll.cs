@@ -13,6 +13,7 @@ static class WpsScroll
 {
     const int WM_MOUSEWHEEL = 0x020A;
     const int WheelDelta = 120;      // 一格 = 120；负值 = 向前滚 = 内容上移
+    const int NotchGapMs = 260;      // 一格一条消息，两条之间留这个间隔（实测 docx：120/160ms 会吞格 6→3~4 格，250ms 起稳定 6/6）
 
     [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr p);
     [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr h, EnumProc cb, IntPtr p);
@@ -85,8 +86,8 @@ static class WpsScroll
         var target = ChildAtPoint(h, cx, cy);
         if (target == IntPtr.Zero) target = h;
 
-        var delta = -WheelDelta * notches * dir;
-        var wp = (IntPtr)(delta << 16);
+        var one = -WheelDelta * dir;
+        var wp = (IntPtr)(one << 16);
         var lp = (IntPtr)((cy << 16) | (cx & 0xFFFF));
         // 关键：Ctrl 被按住时 WPS 把滚轮当"缩放"（Ctrl+滚轮），我们的热键本身就是 Ctrl+Alt+方向键。
         // WPS(Qt) 处理滚轮时看的是当时的修饰键状态，所以不仅要"等到松开"，还要"松开后静默一小段"：
@@ -96,8 +97,16 @@ static class WpsScroll
             diag = "修饰键未松开，未发送";
             return false;
         }
-        SendMessageTimeoutW(target, WM_MOUSEWHEEL, wp, lp, 2, 1500, out _);
-        diag = $"→0x{target.ToInt64():X} ({cx},{cy}) delta={delta}";
+        // 一格一条消息，别把 |delta| 乘上去：WPS 的 docx(OpusApp) **不认 delta 大小**，
+        // 一条消息只滚一格（实测 1 格=84px、6 格合发也是 84px），而 PDF(Qt) 认。
+        // 乘着发就会在 docx 上"按 6 下页面只走 1 格"→ 墨迹冲出去 6 倍，正是用户报的整段错位。
+        // 拆开发 + 120ms 间隔实测稳定（6 条 → dy=505≈6×84）。
+        for (var i = 0; i < notches; i++)
+        {
+            SendMessageTimeoutW(target, WM_MOUSEWHEEL, wp, lp, 2, 1500, out _);
+            if (i + 1 < notches) Thread.Sleep(NotchGapMs);
+        }
+        diag = $"→0x{target.ToInt64():X} ({cx},{cy}) {notches} 格×delta={one} 间隔{NotchGapMs}ms";
         return true;
     }
 

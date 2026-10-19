@@ -54,6 +54,39 @@ internal static class Program
         var notch = args.Length > 1 && int.TryParse(args[1], out var n) ? n : 3;
         Console.OutputEncoding = Encoding.UTF8;
 
+        if (cmd == "units")
+        {
+            // units —— 单位换算自检。防的就是 2026-10-18 那次翻车：希沃八代 288dpi 上
+            // 把"物理像素"当 DIP 用，墨迹走 3 倍、和页面彻底脱离。改 Units.cs 之后跑一遍。
+            var fails = 0;
+            void Check(string name, double got, double want, double tol = 0.01)
+            {
+                var ok = Math.Abs(got - want) <= tol;
+                if (!ok) fails++;
+                Console.WriteLine($"{(ok ? "PASS" : "FAIL")} {name}: {got:0.####} (want {want:0.####})");
+            }
+
+            Check("Scale(96)", Units.Scale(96), 1.0);
+            Check("Scale(288)", Units.Scale(288), 3.0);
+            Check("Scale(0) → 1", Units.Scale(0), 1.0);
+            // 96dpi：60 物理px = 60 DIP
+            Check("PhysToDip(60,1)", Units.PhysToDip(60, 1), 60);
+            // 288dpi：实测 docx 每格 152 物理px = 50.667 DIP
+            Check("PhysToDip(152,3)", Units.PhysToDip(152, 3), 152.0 / 3);
+            // 推墨迹：内容上移 152 物理px → 墨迹上移 50.67 DIP（负）
+            Check("InkDipFor(152,3)", Units.InkDipFor(152, 3), -152.0 / 3);
+            // 补差：预期 152、实测 152 → 0（一致就不动）
+            Check("CorrectionDip(152,152,3)", Units.CorrectionDip(152, 152, 3), 0);
+            // 补差：预期 180、实测 152 → 还差 28 物理px = 9.33 DIP（旧代码按 DIP 减会算出 -30.67，符号都反）
+            Check("CorrectionDip(180,152,3)", Units.CorrectionDip(180, 152, 3), 28.0 / 3);
+            // 对账：页面 152 物理px、墨迹也走了 50.67 DIP → 差 0
+            Check("ReconcileDip 一致", Units.ReconcileDip(152, -152.0 / 3, 3), 0);
+            // 对账：页面没动、墨迹走了 50.67 DIP → 要退 50.67 DIP（旧代码会退 152，跳一大截）
+            Check("ReconcileDip 页面没动", Units.ReconcileDip(0, -152.0 / 3, 3), 152.0 / 3);
+            Console.WriteLine(fails == 0 ? "units: 全部通过" : $"units: {fails} 条失败");
+            return fails == 0 ? 0 : 1;
+        }
+
         if (cmd == "cmp")
         {
             // cmp a.bmp b.bmp [maxShift] —— 离线量两张整屏 BMP 的位移（b 相对 a）
