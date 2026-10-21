@@ -21,7 +21,11 @@ static class WpsScroll
     const int NotchFirstWaitMs = 420; // 首格：WPS 刚打开/刚从后台回来时启动更慢，多给一点
     const int NotchFallbackMs = 100; // 抓帧不可用（黑帧）时的固定间隔
     const int SendBudgetMs = 700;    // 一批最多花这么久等画面；到顶/到底时不能一格一格干等
-    const int ComNotchGapMs = 80;    // 这一格动画结束后再喘一口，避免下一格被并进同一段动画
+    // docx 快速道（0.2.2）：以前每格都要等动画完全停下（≥80ms）再睡 80ms，6 格固定 0.83s。
+    // 现在只等"读数变了"就发下一格，被吐掉的格当场补发，发完再按总位移核对一次。
+    const int ComNotchGapMs = 15;    // 这一格读数变化后再喘一口，避免下一格被并进同一段动画
+    const int ComNotchWaitMs = 60;   // 每格最多等这么久读数变化，超时就算被吞、当场补发
+    const int ComResendMax = 2;      // 一格里最多补发几次
 
     [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr p);
     [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr h, EnumProc cb, IntPtr p);
@@ -136,6 +140,8 @@ static class WpsScroll
         // 发完再抓两张会得到两张一样的"已经跳完"的图，永远等不到变化。
         var comTop = 0;
         var comOk = pos != null && pos.TryReadTop(out comTop);
+        // docx 走快速道：只等读数变化 + 被吞的格当场补发 + 发完核对总量（见 SendComFast）。
+        if (comOk) return SendComFast(target, pos, notches, cx, cy, wp, lp, out diag, out hits);
         Capture.Img a = null, b = null;
         var canWatch = false;
         if (!comOk && !pdfOk)
@@ -174,7 +180,7 @@ static class WpsScroll
                 }
                 if (comOk)
                 {
-                    // 首格多等（刚打开 WPS 启动慢）；连续两格没动多半已到边，后面的别每格干等。
+                    // 已由上面的 SendComFast 处理，这里只做保底（正常走不到）。
                     var wait = i == 0 ? NotchFirstWaitMs : (noMove >= 2 ? 40 : NotchMaxWaitMs);
                     if (WaitComMoved(pos, wait, ref comTop))
                     {
@@ -203,6 +209,76 @@ static class WpsScroll
     }
 
     /// <summary>
+    /// docx(COM 标尺) 的快车道：一条消息一格，只等"读数变了"就发下一格；被动画吞掉的格当场补发；
+    /// 发完再用首格位移核对总量，少了的格补上。
+    /// 旧逻辑每格都要等动画完全停下（≥80ms）再喘 80ms，6 格固定 0.83s，用户反馈"卡"。
+    /// </summary>
+    static bool SendComFast(IntPtr target, WpsDocPos pos, int notches, int cx, int cy, IntPtr wp, IntPtr lp, out string diag, out int hits)
+    {
+        var sw = Stopwatch.StartNew();
+        var waits = 0;
+        var sent = 0;
+        var resend = 0;
+        if (!pos.TryReadTop(out var start)) { diag = "COM 读数失败"; hits = 0; return false; }
+        var cur = start;
+        var px1 = 0;
+        for (var i = 0; i < notches; i++)
+        {
+            var before = cur;
+            SendMessageTimeoutW(target, WM_MOUSEWHEEL, wp, lp, 2, 1500, out _);
+            sent++;
+            var moved = WaitComChanged(pos, i == 0 ? Math.Min(NotchFirstWaitMs, 220) : ComNotchWaitMs, ref cur);
+            var maxR = i == 0 ? 1 : ComResendMax;
+            for (var r = 0; !moved && r < maxR; r++)
+            {
+                resend++;
+                SendMessageTimeoutW(target, WM_MOUSEWHEEL, wp, lp, 2, 1500, out _);
+                sent++;
+                moved = WaitComChanged(pos, ComNotchWaitMs, ref cur);
+            }
+            if (moved)
+            {
+                waits++;
+                if (px1 == 0) px1 = Math.Abs(cur - before);
+                Thread.Sleep(ComNotchGapMs);
+            }
+            else
+            {
+                Thread.Sleep(20);
+                // 第一格就完全没动 → 多半已到页首/页尾，别硬发剩下的。
+                if (i == 0 && px1 == 0) break;
+            }
+        }
+        // 总量核对：按首格位移估应有位移，少了的格补发；到边时读数不再变化就停。
+        var want = notches * px1;
+        while (px1 > 0 && sw.ElapsedMilliseconds < SendBudgetMs && Math.Abs(cur - start) < want - px1 / 2)
+        {
+            SendMessageTimeoutW(target, WM_MOUSEWHEEL, wp, lp, 2, 1500, out _);
+            sent++;
+            if (!WaitComChanged(pos, ComNotchWaitMs, ref cur)) break;
+            resend++;
+            waits++;
+            Thread.Sleep(ComNotchGapMs);
+        }
+        hits = waits;
+        diag = $"→0x{target.ToInt64():X} ({cx},{cy}) {notches} 格 COM快发 {sent}发/补{resend} 位移{Math.Abs(cur - start)}px 用时{sw.ElapsedMilliseconds}ms";
+        return true;
+    }
+
+    /// <summary>只等"读数变了"（不等动画停下）：最多等 maxMs，一变立刻返回。</summary>
+    static bool WaitComChanged(WpsDocPos pos, int maxMs, ref int last)
+    {
+        var sw = Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < maxMs)
+        {
+            Thread.Sleep(5);
+            if (!pos.TryReadTop(out var t)) return false;
+            if (t != last) { last = t; return true; }
+        }
+        return false;
+    }
+
+    /// <summary>
     /// 等这一格滚完：先等 Top 变化，再等它连续几次读数不变（动画结束）。
     /// 只等“变了一下”不够——WPS 的翻页动画还在走时就发下一格，后面的消息会被动画吞掉，
     /// 实测 6 格快发只落了 1 格（96px），然后第二按才补上 504px，第一拍就少测一大截。
@@ -224,9 +300,9 @@ static class WpsScroll
             }
             if (t == cur) stable++;
             else { cur = t; stable = 0; }
-            // 连续 6 次（约 30ms）读数不变，且至少已经走了 80ms，才认为这一格的动画结束。
-            // 之前只等 45ms，WPS 平滑动画中间会有一次短暂停顿，下一格正好发在停顿里被并掉。
-            if (stable >= 6 && sw.ElapsedMilliseconds >= 80)
+            // 连续 2 次（约 10ms）读数不变，且至少已经走了 25ms，就认为这一格动画结束。
+            // 这是旧路径（快速道之外）的稳定门；快速道用 WaitComChanged 只等"变了一下"。
+            if (stable >= 2 && sw.ElapsedMilliseconds >= 25)
             {
                 last = cur;
                 return true;
