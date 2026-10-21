@@ -87,6 +87,9 @@ sealed class WpsFollower : IDisposable
     WpsDocPos _docPos;
     // PDF(Qt) 没有 RangeFromPoint，但 UIA 滚动条 RangeValue 就是物理像素位置；优先用它，不再抓帧。
     WpsPdfPos _pdfPos;
+    // 找 PDF 滚动条要遍历 UIA 树，docx 上必然找不到，实测每次白花 400–500ms（希沃 288dpi 更慢）。
+    // 失败后 3 秒内不再重试：同一份 docx 的连按不会再一笔一笔地赔这 0.4 秒。
+    DateTime _pdfProbeAfter = DateTime.MinValue;
     int _roundNotch;                // 这一轮（自建锚点起）一共下发了多少格（带方向），对账标定用
     int _anchorTries;
     DateTime _zeroAt = DateTime.MinValue;   // 上一次"页面疑似 0px"的时刻（要 300ms 后复核一次才准撤墨迹）
@@ -154,6 +157,10 @@ sealed class WpsFollower : IDisposable
         if (!_enabled()) { Status = "跟随已关闭，忽略"; return false; }
         if (notches <= 0 || dir == 0) return false;
 
+        // 临时诊断：把"按键到发完"这段按阶段计时打出来（尺子 / 排队 / 发送+结算），
+        // 用来定位端到端卡顿到底卡在哪一段。定位完删掉。
+        var swAll = Stopwatch.StartNew();
+
         // 这一拍要推多少，得等"尺子"定下来才能算（下面是先立尺子，再按这把尺子的每格算）。
 
         // 首选：从 WPS 对象模型取一个正文 Range 当"页面刻度尺"。
@@ -180,7 +187,9 @@ sealed class WpsFollower : IDisposable
 
             // PDF 没有 COM 标尺，但它的 Qt 滚动条在 UIA 里是 KPdfScrollBarWheelFixed，
             // RangeValue 就是屏幕物理像素。拿到它就不用再抓整窗截图做内容匹配。
-            if (_pdfPos == null && top != IntPtr.Zero)
+            // 已经有 COM 尺子（docx）就不再找 PDF 滚动条：docx 上必然找不到，
+            // 而这一趟 UIA 遍历实测要 400–500ms，等于每次翻页都先卡半秒。
+            if (_docPos == null && _pdfPos == null && top != IntPtr.Zero && DateTime.UtcNow >= _pdfProbeAfter)
             {
                 var pp = WpsPdfPos.TryCreate(top, out var pwhy);
                 if (pp != null)
@@ -192,13 +201,20 @@ sealed class WpsFollower : IDisposable
                     }
                     if (pp != null)
                     {
+                        _pdfProbeAfter = DateTime.MinValue;
                         pp.TryRead(out var v0);
                         _log($"PDF UIA 标尺: 滚动值={v0}px（0x{top.ToInt64():X}）");
                     }
                 }
-                else if (pwhy.Length != 0) _log($"PDF UIA 标尺不可用: {pwhy}");
+                else
+                {
+                    _pdfProbeAfter = DateTime.UtcNow.AddSeconds(3);
+                    if (pwhy.Length != 0) _log($"PDF UIA 标尺不可用: {pwhy}");
+                }
             }
         }
+
+        var tRuler = swAll.ElapsedMilliseconds;   // 诊断：立尺子花了多久
 
         // 尺子已经定下来了：按**这一把尺子**的每格算这一拍要推多少。
         // 同一份文档里 COM/UIA/截图三把尺子的每格步长并不相同，切文档时必须各用各的，
@@ -280,11 +296,14 @@ sealed class WpsFollower : IDisposable
         // 这样“推墨迹 / 补差 / 下一拍推墨迹”严格按序，不会被排队中的下一拍插进来算错账。
         // 6 格一发正常 300ms 左右，手感仍然是按下去就动，只是连按会排队。
         await _sendGate.WaitAsync().ConfigureAwait(false);
+        var tGate = swAll.ElapsedMilliseconds;   // 诊断：排队等了多久
         try
         {
             if (_docPos == null && _pdfPos == null) shotBefore = Capture.Grab(_hwnd, false, null);
             if (inkDip != 0) await _shift.ApplyAsync(0, inkDip).ConfigureAwait(false);   // 内容上移 = 墨迹上移
-            return SendCore(notches, dir, pxPhys, inkDip, seq, shotBefore);
+            var okSend = SendCore(notches, dir, pxPhys, inkDip, seq, shotBefore);
+            _log($"timing #{seq} {dir * notches} 格 尺子{tRuler}ms 排队{tGate - tRuler}ms 发送+结算{swAll.ElapsedMilliseconds - tGate}ms 合计{swAll.ElapsedMilliseconds}ms");
+            return okSend;
         }
         finally { _sendGate.Release(); }
     }
@@ -910,16 +929,22 @@ sealed class WpsFollower : IDisposable
     void EnsurePdfPos()
     {
         if (_pdfPos != null) return;
+        if (DateTime.UtcNow < _pdfProbeAfter) return;   // 刚找过没找到，别每拍赔一次 UIA 遍历
         var top = WpsScroll.Find(out _);
         if (top == IntPtr.Zero) return;
         var pp = WpsPdfPos.TryCreate(top, out var why);
         if (pp != null)
         {
             _pdfPos = pp;
+            _pdfProbeAfter = DateTime.MinValue;
             pp.TryRead(out var v0);
             _log($"PDF UIA 标尺: 滚动值={v0}px（0x{top.ToInt64():X}）");
         }
-        else if (why.Length != 0) _log($"PDF UIA 标尺不可用: {why}");
+        else
+        {
+            _pdfProbeAfter = DateTime.UtcNow.AddSeconds(3);
+            if (why.Length != 0) _log($"PDF UIA 标尺不可用: {why}");
+        }
     }
 
     /// <summary>
