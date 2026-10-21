@@ -52,9 +52,30 @@ sealed class WpsFollower : IDisposable
     DateTime _lastPressAt = DateTime.MinValue;   // 最近一次按键时间（用来区分"动画残余"和"外部滚动"）
     // 每格滚轮在**屏幕物理像素**上推动页面的量（文档缩放 × 字号 × DPI 的函数）。
     // 未标定前按 96dpi 的 60 乘上当前缩放猜一个；第一拍单格独立测量出来立刻标定。
-    double _stepPhys = Units.GuessStepPhys96;
-    bool _calibrated;               // 是否已用"独立测量的单格位移"标定过（标定值单位＝物理像素）
-    double _stepCand;               // 学习候选：大跳变要连续两次一致才采纳
+    // 按"尺子"分开存三套：docx(COM) 与 PDF(UIA) 的每格步长本来就不同（本机 280% 下 84 vs 60），
+    // 共用一个值的话，切文档之后每次按键都按旧步长多推/少推一截（实测 PDF 每次固定补差 144px，
+    // 表现为"先冲出去再顿回来"）。截图兜底单独一套，免得它的粗测量污染精确标定值。
+    enum Ruler { Shot = 0, Com = 1, Pdf = 2 }
+    readonly double[] _stepBy = { Units.GuessStepPhys96, Units.GuessStepPhys96, Units.GuessStepPhys96 };
+    readonly bool[] _calBy = new bool[3];       // 这套尺子是否已标定（标定值单位＝物理像素）
+    readonly double[] _candBy = new double[3];  // 学习候选：大跳变要连续两次一致才采纳
+    double StepOf(Ruler r) => _stepBy[(int)r];
+    bool CalOf(Ruler r) => _calBy[(int)r];
+    double CandOf(Ruler r) => _candBy[(int)r];
+    /// <summary>当前文档在用的尺子：docx=COM，PDF=UIA，都没有=截图兜底。</summary>
+    Ruler RulerNow => _docPos != null ? Ruler.Com : _pdfPos != null ? Ruler.Pdf : Ruler.Shot;
+    /// <summary>DPI 变了：三套"每格"按新缩放重估，并作废标定（物理比例真的变了）。</summary>
+    void ResetSteps()
+    {
+        for (var i = 0; i < 3; i++) { _stepBy[i] = Units.GuessStepPhys96 * _dpiScale; _calBy[i] = false; _candBy[i] = 0; }
+    }
+    /// <summary>换窗口/换文档：已标定的槽保留（"每格"是文档缩放×字号的物理事实，
+    /// 比 96dpi 的猜值可信），只把没标定过的槽按当前缩放预乘一下。</summary>
+    void ScaleGuesses()
+    {
+        for (var i = 0; i < 3; i++)
+            if (!_calBy[i]) { _stepBy[i] = Units.GuessStepPhys96 * _dpiScale; _candBy[i] = 0; }
+    }
     DateTime _settleUntil = DateTime.MinValue;   // 翻页动画期间不抓帧（中间帧会把基线带脏）
     // 对账锚点：一轮连续按键开始前的基线帧。一轮结束时（画面静止且静置够久）拿它跟当前帧比
     // 总位移，再跟墨迹这一轮实际走的量对账，差多少补多少。多格批次"测不准只能信命令"时
@@ -74,11 +95,11 @@ sealed class WpsFollower : IDisposable
     public double LastDyPx, LastDxPx;
     long _cConfirmed, _cNoMove, _cUnclear, _cTrustBig;   // 心跳里的判断计数，用来看"哪种判断在主导"
     DateTime _lastBeat = DateTime.UtcNow;
-    public double StepPx => Units.PhysToDip(_stepPhys, _dpiScale);   // 对外仍报 DIP（状态栏口径）
-    double StepDip => Units.PhysToDip(_stepPhys, _dpiScale);
+    public double StepPx => Units.PhysToDip(StepOf(RulerNow), _dpiScale);   // 对外仍报 DIP（状态栏口径）
+    double StepDip => Units.PhysToDip(StepOf(RulerNow), _dpiScale);
     // 还没标定时（多半是刚打开 WPS 的第一拍）WPS 首滚启动明显更慢：静置判据多等一会儿，
     // 否则会把"页面还没开始动"误判成"到边没滚"，把刚推出去的墨迹撤回来 —— 首滚差一行就是这么来的。
-    int StillGateMs => _calibrated ? 900 : 1200;
+    int StillGateMs => (CalOf(Ruler.Com) || CalOf(Ruler.Pdf)) ? 900 : 1200;
     // COM 标尺读到的是精确值，WPS 的 docx 滚动基本是瞬移/短动画，450ms 足够定稿；
     // 但刚打开 WPS 的第一拍启动明显慢，仍按未标定多等，避免把"还没开始动"当成到边。
     int ComGateMs => 350;
@@ -133,8 +154,7 @@ sealed class WpsFollower : IDisposable
         if (!_enabled()) { Status = "跟随已关闭，忽略"; return false; }
         if (notches <= 0 || dir == 0) return false;
 
-        var pxPhys = _stepPhys * notches * dir;                 // 账本单位：物理像素
-        var inkDip = Units.InkDipFor(pxPhys, _dpiScale);        // 墨迹单位：DIP（内容上移 = 墨迹上移为负）
+        // 这一拍要推多少，得等"尺子"定下来才能算（下面是先立尺子，再按这把尺子的每格算）。
 
         // 首选：从 WPS 对象模型取一个正文 Range 当"页面刻度尺"。
         // 这一拍按下前记下它的屏幕 Top，结算时再读一次，差值就是页面真正滚了多少物理像素。
@@ -179,6 +199,12 @@ sealed class WpsFollower : IDisposable
                 else if (pwhy.Length != 0) _log($"PDF UIA 标尺不可用: {pwhy}");
             }
         }
+
+        // 尺子已经定下来了：按**这一把尺子**的每格算这一拍要推多少。
+        // 同一份文档里 COM/UIA/截图三把尺子的每格步长并不相同，切文档时必须各用各的，
+        // 否则新文档的第一拍会按旧步长冲出去、结算时再顿回来（实测 PDF 每次补差 144px）。
+        var pxPhys = StepOf(RulerNow) * notches * dir;          // 账本单位：物理像素
+        var inkDip = Units.InkDipFor(pxPhys, _dpiScale);        // 墨迹单位：DIP（内容上移 = 墨迹上移为负）
 
         // 第一拍如果还没有对账锚点（刚启动/刚换文档），先抓一张"按键之前"的帧。
         // 不抓的话这一拍没有任何基线可比，Tick 只能把它当新基线，首滚的实际位移就永远没人核对——
@@ -244,7 +270,7 @@ sealed class WpsFollower : IDisposable
                 _prev = anchorSrc;
             }
         }
-        if (canAnchor) _log($"锚点: 建在 {Units.Describe(_stepPhys, _dpiScale)} 墨迹Y={_shift.Y:0} mean={anchorMean:0}");
+        if (canAnchor) _log($"锚点: 建在 {Units.Describe(StepOf(RulerNow), _dpiScale)} 墨迹Y={_shift.Y:0} mean={anchorMean:0}");
 
         // PDF(Qt) 没有 WPS 的 Window.RangeFromPoint，拿不到 COM 标尺，只能在发送前抓一张帧，
         // 发完看画面有没有真的变。docx 走 COM 时不需要这张 8MB 的帧。
@@ -290,6 +316,9 @@ sealed class WpsFollower : IDisposable
         // 或者刚换文档），现在页面是静止的，取到的 Top 就是这一拍的起点。
         if (_pdfPos == null) EnsureDocPos();
         if (_docPos == null && _pdfPos == null) EnsurePdfPos();
+        // 尺子可能在上一段里刚换过（旧标尺失效被丢弃、这里又重建），重新取一次：
+        // 之后的日志与"每格"口径都以"发送前这一刻"的尺子为准。
+        var ruler = RulerNow;
         _sending = true;
         bool sent;
         string diag;
@@ -329,6 +358,7 @@ sealed class WpsFollower : IDisposable
         else if (_pdfPos != null) SettlePdfPress(pxPhys, notches * dir, pdfAnchor, pdfAnchorOk);
         else if (shotBefore != null) SettleShotPress(shotBefore, pxPhys, notches * dir);
 
+
         _burstUntil = DateTime.UtcNow.AddMilliseconds(BurstHoldMs);   // 让复核尽快跑
         int notchesTotal;
         lock (_gate)
@@ -344,7 +374,7 @@ sealed class WpsFollower : IDisposable
         if (until > _settleUntil) _settleUntil = until;
         _lastPressAt = DateTime.UtcNow;
         _still = 0;
-        _log($"press #{seq} {dir * notches} 格 墨迹({inkDip:0.0}DIP={pxPhys:0}物理px) {Units.Describe(_stepPhys, _dpiScale)} 账本={notchesTotal * _stepPhys:0}物理px {diag} {_shift.Status}");
+        _log($"press #{seq} {dir * notches} 格 墨迹({inkDip:0.0}DIP={pxPhys:0}物理px) {Units.Describe(StepOf(ruler), _dpiScale)} 账本={notchesTotal * StepOf(ruler):0}物理px {diag} {_shift.Status}");
         Status = $"命令 {dir * notches} 格 → 墨迹({inkDip:0}DIP) 每格{StepDip:0}DIP ({(_mouseMode() ? "鼠标" : "画笔")}模式)";
         return true;
     }
@@ -358,7 +388,7 @@ sealed class WpsFollower : IDisposable
             if ((DateTime.UtcNow - _lastBeat).TotalSeconds >= 30)
             {
                 _lastBeat = DateTime.UtcNow;
-                _log($"心跳 {Units.Describe(_stepPhys, _dpiScale)}{(_calibrated ? " 已标定" : " 未标定")} 墨迹{_shift.Status} 判断:确认{_cConfirmed}/没滚{_cNoMove}/分不开{_cUnclear}/大批量信命令{_cTrustBig} tick={Ticks}");
+                _log($"心跳 {Units.Describe(StepOf(RulerNow), _dpiScale)}{(CalOf(Ruler.Com) || CalOf(Ruler.Pdf) || CalOf(Ruler.Shot) ? " 已标定" : " 未标定")} 墨迹{_shift.Status} 判断:确认{_cConfirmed}/没滚{_cNoMove}/分不开{_cUnclear}/大批量信命令{_cTrustBig} tick={Ticks}");
             }
             Thread.Sleep(burst ? BurstMs : IdleMs);
         }
@@ -390,13 +420,12 @@ sealed class WpsFollower : IDisposable
             {
                 var dpi = WpsScroll.Dpi(_hwnd);
                 _dpiScale = Units.Scale(dpi);
-                // 未标定时的起步值 60 是 96dpi 口径；288dpi 大屏上必须先乘 3，否则第一拍按 60px 推、
-                // 实际滚 180px，补差补成反方向，PDF 首拍就会“闪一下又回去”。
-                _stepPhys = Units.GuessStepPhys96 * _dpiScale;
-                _calibrated = false;
-                _stepCand = 0;
+                // 起步值 60 是 96dpi 口径，没标定过的槽按当前缩放预乘。已标定的槽保留：
+                // WPS 换文档/换标签会重建窗口，三把尺子（截图/docx/PDF）各自的值不能因为换窗口就丢掉，
+                // 否则"docx 标好 80、切到 PDF 又打回 60"的老毛病在真实场景里必然复现。
+                ScaleGuesses();
                 Status = $"已锁定 WPS 窗口 0x{_hwnd.ToInt64():X} dpi={dpi}";
-                _log($"锁定窗口 0x{_hwnd.ToInt64():X} {diag} dpi={dpi}（每格按 {Units.Describe(_stepPhys, _dpiScale)} 起步，待标定）");
+                _log($"锁定窗口 0x{_hwnd.ToInt64():X} {diag} dpi={dpi}（每格 docx {Units.Describe(StepOf(Ruler.Com), _dpiScale)} / PDF {Units.Describe(StepOf(Ruler.Pdf), _dpiScale)} / 截图 {Units.Describe(StepOf(Ruler.Shot), _dpiScale)}）");
             }
         }
 
@@ -407,11 +436,9 @@ sealed class WpsFollower : IDisposable
             var sc = Units.Scale(WpsScroll.Dpi(_hwnd));
             if (Math.Abs(sc - _dpiScale) > 0.01)
             {
-                _log($"DPI 变化 {_dpiScale * 96:0} → {sc * 96:0} → 作废账本、每格重新标定（旧值 {Units.Describe(_stepPhys, _dpiScale)}）");
+                _log($"DPI 变化 {_dpiScale * 96:0} → {sc * 96:0} → 作废账本、每格重新标定（旧值 {Units.Describe(StepOf(RulerNow), _dpiScale)}）");
                 _dpiScale = sc;
-                _stepPhys = Units.GuessStepPhys96 * _dpiScale;
-                _calibrated = false;
-                _stepCand = 0;
+                ResetSteps();
                 Reset();
                 return;
             }
@@ -527,7 +554,7 @@ sealed class WpsFollower : IDisposable
         if (expPx0 != 0)
         {
             var dyMove = (int)Math.Round(expPx0);
-            var step = (int)Math.Max(20, Math.Round(_stepPhys));   // 物理像素（与 dyMove 同口径）
+            var step = (int)Math.Max(20, Math.Round(StepOf(Ruler.Shot)));   // 物理像素（与 dyMove 同口径）
 
             // 先判"页面根本没动"（到顶/到底）。这个判据必须极硬，否则把正常滚动误判成没动
             // 就等于把一整批乐观平移撤回，墨迹与页面直接差出一大段（用户踩到的"像素不同步"）。
@@ -574,7 +601,7 @@ sealed class WpsFollower : IDisposable
                 var measOk = meas != null;
                 // 大批量（>2 格）却量出 0px，是空白页边/页间留白最典型的假零：一整批墨迹会被全额退回。
                 // 这种证据不够硬，宁可这轮"信命令"等下一轮，也不撤回整批（用户希沃 540px 回滚就是这么来的）。
-                if (measOk && Math.Abs(expPx0) > 2 * _stepPhys && Math.Abs(meas.Dy) <= 8 && diff < 8)
+                if (measOk && Math.Abs(expPx0) > 2 * StepOf(Ruler.Shot) && Math.Abs(meas.Dy) <= 8 && diff < 8)
                 {
                     _log($"#{seqAt} 大批量实测 0px 但账本 {expPx0:0}px → 疑似空白带假零，不撤回");
                     meas = null;
@@ -794,9 +821,11 @@ sealed class WpsFollower : IDisposable
         var sampleOk = _measuredSample ? (m.Score >= 0.95 && (m.Score - m.SecondScore) >= 0.03)
                                       : (m.Score >= 0.985 && (m.Score - m.SecondScore) >= 0.05);
         var notchAbs = Math.Abs(expNotch);
-        var perNotchOk = notchAbs == 1 || (_measuredSample && !_calibrated);
+        // 这段的样本来自"截图比对"，只写截图那把尺子的槽：它的粗测量不该覆盖 COM/UIA 的精确标定值。
+        var R = Ruler.Shot;
+        var perNotchOk = notchAbs == 1 || (_measuredSample && !CalOf(R));
         if (expNotch != 0 && m.Dy != 0 && Math.Sign(m.Dy) == Math.Sign(expNotch)
-            && perNotchOk && notchAbs > 0 && sampleOk && (_calibrated || _measuredSample))
+            && perNotchOk && notchAbs > 0 && sampleOk && (CalOf(R) || _measuredSample))
         {
             var cand = (double)Math.Abs(m.Dy) / notchAbs;   // 每格＝总位移/格数（物理像素）
             var candMax = 4.0 * img.H;                   // 不设死上限：4K/深缩放下真实值可以很大
@@ -805,15 +834,15 @@ sealed class WpsFollower : IDisposable
                 // 首次标定：一条独立测量就够（前面 sampleOk 已经卡了相似度与领先量）。
                 // 之前要求"两次一致"，结果 docx 永远停在错误的 60 上（真值 84），
                 // 每按一下差 24px，十下就是一整行——这才是 docx 累积错位的主因。
-                if (!_calibrated && _measuredSample) { LearnStep(cand, "首次标定"); _stepCand = 0; }
-                else if (Math.Abs(cand - _stepPhys) / _stepPhys <= 0.08) { _stepCand = 0; if (!_calibrated) LearnStep(cand, "首次标定"); }
-                else if (_stepCand > 0 && Math.Abs(cand - _stepCand) <= 2)
+                if (!CalOf(R) && _measuredSample) { LearnStep(cand, "首次标定", R); _candBy[(int)R] = 0; }
+                else if (Math.Abs(cand - StepOf(R)) / StepOf(R) <= 0.08) { _candBy[(int)R] = 0; if (!CalOf(R)) LearnStep(cand, "首次标定", R); }
+                else if (CandOf(R) > 0 && Math.Abs(cand - CandOf(R)) <= 2)
                 {
-                    LearnStep(cand, _calibrated ? "连续两次一致" : "首次标定(两次一致)");
-                    _stepCand = 0;
+                    LearnStep(cand, CalOf(R) ? "连续两次一致" : "首次标定(两次一致)", R);
+                    _candBy[(int)R] = 0;
                 }
                 else if (m.Score >= 0.99 && (m.Score - m.SecondScore) >= 0.03
-                         && (!_calibrated || Math.Abs(cand - _stepPhys) <= 0.5 * _stepPhys))
+                         && (!CalOf(R) || Math.Abs(cand - StepOf(R)) <= 0.5 * StepOf(R)))
                 {
                     // 双带一致 + 近满分：这种样本不该再等第二次。换文档/改缩放后第一下就要把
                     // 每格像素改对，否则后面每一拍都按老每格走，误差会累积成一整行
@@ -821,10 +850,10 @@ sealed class WpsFollower : IDisposable
                     // 但**倍数级跳变**（>1.5 倍或 <0.67 倍）必须先等第二次一致：那多半不是"每格变了"，
                     // 而是一帧里攒了多拍（帧间隔 60~200ms vs 按键间隔 150~300ms），
                     // 直接采纳就把每格写成 3 倍（实测 `每格 60px → 180px（强匹配立即学）`，十拍甩出 900px）。
-                    LearnStep(cand, _calibrated ? "强匹配立即学" : "首次标定(强匹配)");
-                    _stepCand = 0;
+                    LearnStep(cand, CalOf(R) ? "强匹配立即学" : "首次标定(强匹配)", R);
+                    _candBy[(int)R] = 0;
                 }
-                else _stepCand = cand;
+                else _candBy[(int)R] = cand;
             }
         }
 
@@ -857,7 +886,7 @@ sealed class WpsFollower : IDisposable
         if (ok) Applied++;
         // 到边撤回（EDGE）是正常行为，别算进 JUMP 告警
         var tag = m.Dy == 0 && expected != 0 ? "EDGE " : (Math.Abs(needDy) >= 300 ? "JUMP " : "");
-        _log($"{tag}apply dy={m.Dy}px dx={m.Dx}px 预期={expected:0}px 补差=({needDx:0},{needDy:0}) 相似度={m.Score:0.000}/{m.SecondScore:0.000} {Units.Describe(_stepPhys, _dpiScale)} 账本={expNotch}拍 diff={diff:0.0} {sw.ElapsedMilliseconds}ms {_shift.Status}");
+        _log($"{tag}apply dy={m.Dy}px dx={m.Dx}px 预期={expected:0}px 补差=({needDx:0},{needDy:0}) 相似度={m.Score:0.000}/{m.SecondScore:0.000} {Units.Describe(StepOf(Ruler.Shot), _dpiScale)} 账本={expNotch}拍 diff={diff:0.0} {sw.ElapsedMilliseconds}ms {_shift.Status}");
         Swap();
         Status = $"实测 dy={m.Dy}px 补差({needDx:0},{needDy:0}) 每格{StepDip:0}DIP {sw.ElapsedMilliseconds}ms";
     }
@@ -916,7 +945,7 @@ sealed class WpsFollower : IDisposable
             return;
         }
 
-        var deadline = DateTime.UtcNow.AddMilliseconds(_calibrated ? 700 : 1200);
+        var deadline = DateTime.UtcNow.AddMilliseconds(CalOf(Ruler.Pdf) ? 700 : 1200);
         var moved = 0;
         var seen = false;
         var stable = 0;
@@ -952,7 +981,7 @@ sealed class WpsFollower : IDisposable
         {
             _shift.ApplyAsync(0, need).GetAwaiter().GetResult();
             Applied++;
-            _log($"PDF UIA 逐拍 实测 {moved}px，预期 {expected:0}px → 补差({need:0}DIP) {Units.Describe(_stepPhys, _dpiScale)} {_shift.Status}");
+            _log($"PDF UIA 逐拍 实测 {moved}px，预期 {expected:0}px → 补差({need:0}DIP) {Units.Describe(StepOf(Ruler.Pdf), _dpiScale)} {_shift.Status}");
             Status = $"PDF UIA dy={moved}px 补差({need:0}) 每格{StepDip:0}DIP";
         }
         else
@@ -967,8 +996,8 @@ sealed class WpsFollower : IDisposable
             && Math.Abs(expected) > 0.5 && Math.Abs(moved) >= 0.8 * Math.Abs(expected))
         {
             var cand = Math.Abs((double)moved) / Math.Abs(expNotch);
-            if (cand >= 20 && cand <= 4000 && Math.Abs(cand - _stepPhys) / _stepPhys > 0.02)
-                CalibrateStep(cand, $"PDF UIA逐拍({Math.Abs(expNotch)}格)");
+            if (cand >= 20 && cand <= 4000 && Math.Abs(cand - StepOf(Ruler.Pdf)) / StepOf(Ruler.Pdf) > 0.02)
+                CalibrateStep(cand, $"PDF UIA逐拍({Math.Abs(expNotch)}格)", Ruler.Pdf);
         }
 
         _anchor = null; _anchorTries = 0; _roundNotch = 0; _zeroAt = DateTime.MinValue;
@@ -993,7 +1022,7 @@ sealed class WpsFollower : IDisposable
     void SettleShotPress(Capture.Img before, double expected, int expNotch)
     {
         if (before == null || before.Bgra == null) return;
-        var deadline = DateTime.UtcNow.AddMilliseconds(_calibrated ? 900 : 1400);
+        var deadline = DateTime.UtcNow.AddMilliseconds(CalOf(Ruler.Shot) ? 900 : 1400);
         var prev = before;
         Capture.Img last = null;
         var moved = false;
@@ -1089,8 +1118,8 @@ sealed class WpsFollower : IDisposable
             && Math.Sign(actual) == Math.Sign(expNotch))
         {
             var cand = Math.Abs(actual) / Math.Abs(expNotch);
-            if (cand >= 20 && cand <= 4000 && Math.Abs(cand - _stepPhys) / _stepPhys > 0.02)
-                CalibrateStep(cand, $"截图逐拍({Math.Abs(expNotch)}格)");
+            if (cand >= 20 && cand <= 4000 && Math.Abs(cand - StepOf(Ruler.Shot)) / StepOf(Ruler.Shot) > 0.02)
+                CalibrateStep(cand, $"截图逐拍({Math.Abs(expNotch)}格)", Ruler.Shot);
         }
         _anchor = null; _anchorTries = 0; _roundNotch = 0; _zeroAt = DateTime.MinValue;
         _prev = null;
@@ -1101,7 +1130,7 @@ sealed class WpsFollower : IDisposable
         var pos = _docPos;
         if (pos == null) return;
         var anchor = pos.Top;
-        var deadline = DateTime.UtcNow.AddMilliseconds(_calibrated ? 700 : 1400);
+        var deadline = DateTime.UtcNow.AddMilliseconds(CalOf(Ruler.Com) ? 700 : 1400);
         var moved = 0;
         var seen = false;
         var stable = 0;
@@ -1137,7 +1166,7 @@ sealed class WpsFollower : IDisposable
         {
             _shift.ApplyAsync(0, need).GetAwaiter().GetResult();
             Applied++;
-            _log($"COM 逐拍 实测 {moved}px，预期 {expected:0}px → 补差({need:0}DIP) {Units.Describe(_stepPhys, _dpiScale)} {_shift.Status}");
+            _log($"COM 逐拍 实测 {moved}px，预期 {expected:0}px → 补差({need:0}DIP) {Units.Describe(StepOf(Ruler.Com), _dpiScale)} {_shift.Status}");
             Status = $"COM 逐拍 dy={moved}px 补差({need:0}) 每格{StepDip:0}DIP";
         }
         else
@@ -1153,8 +1182,8 @@ sealed class WpsFollower : IDisposable
             && Math.Abs(expected) > 0.5 && Math.Abs(moved) >= 0.8 * Math.Abs(expected))
         {
             var cand = Math.Abs((double)moved) / Math.Abs(expNotch);
-            if (cand >= 20 && cand <= 4000 && Math.Abs(cand - _stepPhys) / _stepPhys > 0.02)
-                CalibrateStep(cand, $"COM逐拍({Math.Abs(expNotch)}格)");
+            if (cand >= 20 && cand <= 4000 && Math.Abs(cand - StepOf(Ruler.Com)) / StepOf(Ruler.Com) > 0.02)
+                CalibrateStep(cand, $"COM逐拍({Math.Abs(expNotch)}格)", Ruler.Com);
         }
 
         DisposeDocPos();
@@ -1171,15 +1200,15 @@ sealed class WpsFollower : IDisposable
     }
 
     /// <summary>改"每格物理像素"，并把还没被复核的那几拍按新每格重算（否则误差会累积成一整行）。</summary>
-    void LearnStep(double cand, string why)
+    void LearnStep(double cand, string why, Ruler r = Ruler.Shot)
     {
-        var old = _stepPhys;
-        if (Math.Abs(cand - old) < 1 && _calibrated) return;
-        _stepPhys = cand;
-        _calibrated = true;
+        var old = StepOf(r);
+        if (Math.Abs(cand - old) < 1 && CalOf(r)) return;
+        _stepBy[(int)r] = cand;
+        _calBy[(int)r] = true;
         int pendNotch;
         lock (_gate) pendNotch = _pendingNotch;
-        var deltaPhys = pendNotch * (_stepPhys - old);            // 物理像素
+        var deltaPhys = pendNotch * (cand - old);            // 物理像素
         if (Math.Abs(deltaPhys) >= 2)
         {
             lock (_gate) _pendingPx += deltaPhys;
@@ -1218,7 +1247,7 @@ sealed class WpsFollower : IDisposable
         // 账本为 0 = 这轮还没有"待核对的位移"。什么都不做，尤其不要消耗三次重试预算：
         // 以前空闲的每一拍都在跑匹配、三次失败就把锚点丢了，等用户真按键时已经没锚点可用
         // （实测 docx 连按时每轮都在"锚点: 静置后重建 → 对账测不出 → 放弃锚点"里打转）。
-        if (Math.Abs(ink) * _dpiScale < Math.Max(20.0, _stepPhys * 0.5))
+        if (Math.Abs(ink) * _dpiScale < Math.Max(20.0, StepOf(Ruler.Shot) * 0.5))
             return true;
 
         // 一轮滚了超过 6 个窗口高，两帧之间已经没有共同内容可比，别浪费一秒去测。
@@ -1264,7 +1293,7 @@ sealed class WpsFollower : IDisposable
         // "页面没动"而把墨迹撤回去（实测出现过 上带(0) 的假零）。
         // 搜索范围必须跟着账本走：一轮 6 格 × 84px × 3 次 = 1512px，早就超过写死的 1600 上限，
         // 于是"大批量"永远测不出（这是 docx 连按后对账全程失灵的直接原因）。
-        var recMax = (int)Math.Min(3.0 * a.H, Math.Max(600.0, Math.Abs(ink) * _dpiScale + 4 * _stepPhys));
+        var recMax = (int)Math.Min(3.0 * a.H, Math.Max(600.0, Math.Abs(ink) * _dpiScale + 4 * StepOf(Ruler.Shot)));
         if (Capture.MatchTwoBandsLoose(a, img, recMax, out var rr2)) { rr = rr2; decided = true; }
         else if (Capture.MatchAnyBandLoose(a, img, recMax, out var rr1) && rr1.Dy != 0) { rr = rr1; decided = true; }
         else
@@ -1276,7 +1305,7 @@ sealed class WpsFollower : IDisposable
         }
 
         // 一格 = 多少：阈值分两套口径 —— rr.Dy 是物理像素，ink/corr 是 DIP。
-        var stepMinPhys = Math.Max(20.0, _stepPhys * 0.6);
+        var stepMinPhys = Math.Max(20.0, StepOf(Ruler.Shot) * 0.6);
         var stepMin = Units.PhysToDip(stepMinPhys, _dpiScale);
         var zeroVerdict = false;
         if (decided)
@@ -1319,11 +1348,11 @@ sealed class WpsFollower : IDisposable
         // 标定：这一轮一共下了 _roundNotch 格、页面实测走了 rr.Dy 物理px → 每格 = 总位移/格数。
         // 这是"未标定"状态下最干净的一次独立测量（比单拍照实，因为整轮位移远大于噪声）。
         // 必须在下面结账之前做：CalibrateStep 只改每格值，不动墨迹（此时墨迹即将按 corr 对齐）。
-        if (independent && !_calibrated && _roundNotch != 0 && Math.Abs(rr.Dy) >= 20
+        if (independent && !CalOf(Ruler.Shot) && _roundNotch != 0 && Math.Abs(rr.Dy) >= 20
             && Math.Sign(rr.Dy) == Math.Sign(_roundNotch))
         {
             var cand = Math.Abs((double)rr.Dy) / Math.Abs(_roundNotch);
-            if (cand >= 20 && cand <= 4.0 * a.H) CalibrateStep(cand, $"对账标定({Math.Abs(_roundNotch)} 格)");
+            if (cand >= 20 && cand <= 4.0 * a.H) CalibrateStep(cand, $"对账标定({Math.Abs(_roundNotch)} 格)", Ruler.Shot);
         }
 
         // 闸门二："页面 0px"这种结论要 300ms 后再确认一次。
@@ -1343,7 +1372,7 @@ sealed class WpsFollower : IDisposable
         _zeroAt = DateTime.MinValue;
 
         _anchor = null; _anchorTries = 0; _roundNotch = 0;
-        var lim = Math.Max(Units.PhysToDip(_stepPhys * 3, _dpiScale), Math.Abs(ink) + Units.PhysToDip(_stepPhys, _dpiScale));
+        var lim = Math.Max(Units.PhysToDip(StepOf(Ruler.Shot) * 3, _dpiScale), Math.Abs(ink) + Units.PhysToDip(StepOf(Ruler.Shot), _dpiScale));
         if (Math.Abs(corr) < stepMin)
         {
             _log($"对账: 墨迹走了 {ink:0}px，{note} → 差 {corr:0}px 不足一格，不动 {_shift.Status}");
@@ -1363,15 +1392,20 @@ sealed class WpsFollower : IDisposable
     /// 纯标定：只改"每格物理像素"，不动墨迹、不碰账本。
     /// 给"对账时整轮独立测量"用 —— 那一刻墨迹马上就要按对账结果对齐，再顺手推它一下会把账算乱。
     /// </summary>
-    void CalibrateStep(double cand, string why)
+    void CalibrateStep(double cand, string why, Ruler? ruler = null)
     {
-        var old = _stepPhys;
-        _stepPhys = cand;
-        _calibrated = true;
-        _stepCand = 0;
-        _log($"每格 {Units.Describe(old, _dpiScale)} → {Units.Describe(cand, _dpiScale)}（{why}）");
+        // 只改这个样本所属的那把尺子：docx 的 COM 标定值和 PDF 的 UIA 标定值
+        // 是两份独立的物理事实，互相覆盖会让切文档之后的第一拍按错步长推。
+        var r = ruler ?? RulerNow;
+        var old = StepOf(r);
+        if (Math.Abs(cand - old) < 0.01 && CalOf(r)) return;
+        _stepBy[(int)r] = cand;
+        _calBy[(int)r] = true;
+        _candBy[(int)r] = 0;
+        _log($"每格{SlotName(r)} {Units.Describe(old, _dpiScale)} → {Units.Describe(cand, _dpiScale)}（{why}）");
     }
 
+    static string SlotName(Ruler r) => r switch { Ruler.Com => "(docx)", Ruler.Pdf => "(PDF)", _ => "(截图)" };
     /// <summary>取走并清零"已乐观平移但还没被实测确认"的账本。</summary>
     void TakePending(out double px, out int notch)
     {
