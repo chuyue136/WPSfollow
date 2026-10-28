@@ -37,7 +37,8 @@ public sealed class WpsInkSyncPlugin : PluginBase
     enum UiMode { Always, WpsOnly, Off }
     UiMode _uiMode = UiMode.Always;
     bool _sixRows = true;                // 是否显示 6 行滚动按钮（上6/下6）
-    bool _wpsPresent;                    // 上一次探测到的"WPS 文档窗口存在"
+    bool _wpsPresent;                    // 上一次探测到的"WPS 正显示 docx/PDF"
+    WpsScroll.DocKind _wpsKind;          // 上次探测到的文档类型（docx / PDF），只用来打日志
     StackPanel _panel;                   // 工具栏根面板（隐藏时整块 Collapsed）
     FrameworkElement _up1, _down1, _up6, _down6;   // 翻页按钮，单独留着控制显隐（跟随关闭时全部收起）
     IHotkeyService _hot;
@@ -110,20 +111,28 @@ public sealed class WpsInkSyncPlugin : PluginBase
         ApplySixRows();
 
         // 状态条定时刷新（跟随器跑在后台线程，UI 只读它的快照）。
-        // 顺便每 500ms 探一次 WPS 在不在——"仅当 WPS 运行时"靠它生效，
-        // 也就是 WPS 一关，抓帧线程立刻停掉（不再每个 400ms 抓 8MB 帧）。
+        // 顺便每 500ms 探一次"WPS 里现在显示的是不是 docx/PDF"——"仅当 WPS 文档/PDF 时"靠它生效：
+        // 切到 PPT 标签或关掉文档，按钮立刻收起、抓帧线程停掉（不再每个 400ms 抓 8MB 帧）。
         var ui = System.Windows.Application.Current?.Dispatcher ?? System.Windows.Threading.Dispatcher.CurrentDispatcher;
         var timer = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
         timer.Tick += (_, _) =>
         {
             if (_uiMode == UiMode.WpsOnly)
             {
-                var present = WpsPresent();
+                var present = WpsPresent(out var kind, out var why);
                 if (present != _wpsPresent)
                 {
                     _wpsPresent = present;
-                    Log($"WPS {(present ? "已运行" : "已退出")} → 插件{(present ? "启动" : "停止")}");
+                    _wpsKind = kind;
+                    Log(present
+                        ? $"WPS 文档就绪（{KindText(kind)}）→ 插件启动 | {why}"
+                        : $"WPS 里没有 docx/PDF 文档了（{KindText(kind)}）→ 插件停止 | {why}");
                     ApplyUiMode();
+                }
+                else if (present && kind != _wpsKind)
+                {
+                    _wpsKind = kind;
+                    Log($"WPS 活动标签换成 {KindText(kind)} | {why}");
                 }
             }
             // 宿主在某些时机（重建工具栏、切模式）会把我们塞回去，这里兜住别人的手
@@ -144,12 +153,26 @@ public sealed class WpsInkSyncPlugin : PluginBase
         timer.Start();
     }
 
-    /// <summary>WPS 文档窗口在不在（和抓帧用的是同一个判断口径）。</summary>
-    static bool WpsPresent()
+    /// <summary>
+    /// 当前有没有"正在显示 doc(x) 或 PDF"的 WPS 窗口。
+    /// 注意不是"WPS 进程在不在"：WPS 里只开着 PPT/表格时，插件按钮要收起来，热键也不注册。
+    /// 多标签页按"哪个文档视图正在显示"判断，所以同一个 WPS 里同时开着 docx 和 PDF 时，看的是活动标签。
+    /// </summary>
+    static bool WpsPresent() => WpsPresent(out _, out _);
+
+    static bool WpsPresent(out WpsScroll.DocKind kind, out string diag)
     {
-        try { return WpsScroll.Find(out _) != IntPtr.Zero; }
-        catch { return false; }
+        try { return WpsScroll.DocPresent(out kind, out diag); }
+        catch (Exception ex) { kind = WpsScroll.DocKind.None; diag = "probe 异常: " + ex.Message; return false; }
     }
+
+    static string KindText(WpsScroll.DocKind k) => k switch
+    {
+        WpsScroll.DocKind.Word => "docx",
+        WpsScroll.DocKind.Pdf => "PDF",
+        WpsScroll.DocKind.Other => "其它文档",
+        _ => "无"
+    };
 
     static UiMode ParseMode(string s) => s switch
     {
@@ -283,7 +306,7 @@ public sealed class WpsInkSyncPlugin : PluginBase
     {
         if (_uiMode == m) { ApplyUiMode(); return; }
         _uiMode = m;
-        if (m == UiMode.WpsOnly) _wpsPresent = WpsPresent();
+        if (m == UiMode.WpsOnly) { _wpsPresent = WpsPresent(out var k, out _); _wpsKind = k; }
         SaveString(KeyUiMode, ModeText(m));
         try { _settings?.Set(KeyUiMode, ModeText(m)); } catch (Exception ex) { LogError("写宿主设置 uiMode", ex); }
         ApplyUiMode();
@@ -336,13 +359,13 @@ public sealed class WpsInkSyncPlugin : PluginBase
 
         // ---- 显示策略：显示插件按钮（始终 / 仅当 WPS 运行时 / 关闭）----
         _radioAlways = new RadioButton { Content = "始终", GroupName = "wpsMode", IsChecked = _uiMode == UiMode.Always, Margin = new Thickness(0, 0, 12, 0) };
-        _radioWps = new RadioButton { Content = "仅当 WPS 运行时", GroupName = "wpsMode", IsChecked = _uiMode == UiMode.WpsOnly, Margin = new Thickness(0, 0, 12, 0) };
+        _radioWps = new RadioButton { Content = "仅当 WPS doc(x)/PDF 时", GroupName = "wpsMode", IsChecked = _uiMode == UiMode.WpsOnly, Margin = new Thickness(0, 0, 12, 0) };
         _radioOff = new RadioButton { Content = "关闭", GroupName = "wpsMode", IsChecked = _uiMode == UiMode.Off };
         _radioAlways.Checked += (_, _) => SetUiMode(UiMode.Always);
         _radioWps.Checked += (_, _) => SetUiMode(UiMode.WpsOnly);
         _radioOff.Checked += (_, _) => SetUiMode(UiMode.Off);
 
-        root.Children.Add(SettingsRow("显示插件按钮", "当设为关闭时，插件停止运行。选“仅当 WPS 运行时”，WPS 一关（.docx/.pdf）插件也自动停。",
+        root.Children.Add(SettingsRow("显示插件按钮", "当设为关闭时，插件停止运行。选“仅当 WPS doc(x)/PDF 时”，只有 WPS 当前活动标签是 .docx/.doc/.pdf 才显示按钮和热键；切到 PPT/表格标签、或关掉文档就自动收起。",
             _radioAlways, _radioWps, _radioOff));
 
         // ---- 是否显示 6 行滚动按钮 ----

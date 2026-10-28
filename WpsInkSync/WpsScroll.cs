@@ -44,14 +44,22 @@ static class WpsScroll
 
     public static uint Dpi(IntPtr h) => GetDpiForWindow(h);
 
-    /// <summary>挑面积最大的、可见的 wps/wpspdf/wpp/et 主窗口（PDF 是 Qt5QWindowIcon，.docx 是 OpusApp）。</summary>
+    /// <summary>当前活动文档的类型：只认 doc(x) 和 PDF，PPT/表格/其它都算 Other。</summary>
+    public enum DocKind { None, Word, Pdf, Other }
+
+    static readonly HashSet<string> WpsProcs = new(StringComparer.OrdinalIgnoreCase) { "wps", "wpspdf", "wpp", "et" };
+
+    /// <summary>
+    /// 挑面积最大、可见、且"当前显示的是 docx/doc 或 PDF"的 WPS 窗口。
+    /// 0.2.4 起不再按顶层类名过滤：从 PPT 启动的 WPS，顶层是 PP12FrameClass（统一框架），
+    /// docx/PDF 都挂在这个框架下面。老逻辑只认 Qt5*/OpusApp，遇到这种 WPS 会当成"没找到窗口"。
+    /// 现在改为"子树里必须有正在显示的文档视图"，顺带把对话框、启动器、PPT 窗口排掉。
+    /// </summary>
     public static IntPtr Find(out string diag)
     {
         var best = IntPtr.Zero;
         long bestArea = 0;
-        var seen = 0; var cls = "";
-        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "wps", "wpspdf", "wpp", "et" };
-        IntPtr found = IntPtr.Zero;
+        var seen = 0; var desc = "";
         EnumWindows((h, _) =>
         {
             if (!IsWindowVisible(h) || IsIconic(h)) return true;
@@ -60,29 +68,99 @@ static class WpsScroll
             string proc;
             try { using var p = Process.GetProcessById((int)pid); proc = p.ProcessName; }
             catch { return true; }
-            if (!names.Contains(proc)) return true;
-
-            var sb = new StringBuilder(256);
-            GetClassNameW(h, sb, 256);
-            var c = sb.ToString();
-            // 同一个 WPS 里 PDF 走 Qt 外壳（Qt5QWindowIcon），.doc(x) 走 Word 兼容外壳（OpusApp）。
-            // 只认 Qt5 会让 .docx 直接"没找到窗口"（用户实测踩到）。
-            if (!c.StartsWith("Qt5", StringComparison.Ordinal) && c != "OpusApp") return true;
+            if (!WpsProcs.Contains(proc)) return true;
 
             GetWindowRect(h, out var r);
             var area = (long)(r.R - r.L) * (r.B - r.T);
+            if (area < 300L * 200) return true;                 // 提示条/浮动小窗
             var title = new StringBuilder(512);
             GetWindowTextW(h, title, 512);
             if (title.Length == 0) return true;
+
+            var kind = KindOf(h, out var detail);
+            if (kind != DocKind.Word && kind != DocKind.Pdf) return true;   // PPT/表格/其它不认
+
+            var sb = new StringBuilder(256);
+            GetClassNameW(h, sb, 256);
             seen++;
-            cls = $"{proc}/{c} '{title}' {r.R - r.L}x{r.B - r.T}";
+            desc = $"{proc}/{sb} '{title}' {r.R - r.L}x{r.B - r.T} {detail}";
             if (area <= bestArea) return true;
             bestArea = area; best = h;
             return true;
         }, IntPtr.Zero);
-        found = best;
-        diag = seen == 0 ? "没有 wps/wpspdf 的 Qt5/OpusApp 可见窗口" : $"候选 {seen} 个，选中 {cls}";
-        return found;
+        diag = best != IntPtr.Zero
+            ? $"候选 {seen} 个，选中 {desc}"
+            : seen == 0
+                ? "没有正在显示 docx/doc 或 PDF 的 WPS 窗口"
+                : $"候选 {seen} 个，但都不可用（最近一个: {desc}）";
+        return best;
+    }
+
+    /// <summary>
+    /// 判断这个 WPS 窗口当前正在显示哪种文档。
+    /// 依据是"哪个文档视图是可见的"：切到别的标签后，旧标签的视图会被 IsWindowVisible 判为不可见，
+    /// 所以多标签页里也能只看当前活动标签。
+    /// </summary>
+    public static DocKind KindOf(IntPtr top, out string detail)
+    {
+        detail = "";
+        if (top == IntPtr.Zero) return DocKind.None;
+
+        var wordView = IntPtr.Zero; var wordDetail = "";
+        var pdfView = IntPtr.Zero; var pdfDetail = "";
+        EnumChildWindows(top, (h, _) =>
+        {
+            if (!IsWindowVisible(h)) return true;
+            var sb = new StringBuilder(256);
+            GetClassNameW(h, sb, 256);
+            var c = sb.ToString();
+            var isWord = c == "OpusApp" || c == "_WwG";
+            var isQt = c.StartsWith("Qt5", StringComparison.Ordinal);
+            if (!isWord && !isQt) return true;
+
+            var t = new StringBuilder(512);
+            GetWindowTextW(h, t, 512);
+            var title = t.ToString();
+
+            if (isWord)
+            {
+                if (wordView == IntPtr.Zero) { wordView = h; wordDetail = $"docx({c} '{title}')"; }
+                return true;
+            }
+            // PDF 的 Qt 文档窗口标题是 "xxx.pdf - WPS PDF" 或 "xxx.pdf"；WPS 自己的外壳/标签条也是 Qt5，
+            // 只看"是 Qt5"会把 docx 窗口里的标签条误判成 PDF，所以必须带 PDF 特征。
+            var looksPdf = title.IndexOf("WPS PDF", StringComparison.OrdinalIgnoreCase) >= 0
+                        || title.TrimEnd().EndsWith(".pdf", StringComparison.OrdinalIgnoreCase);
+            if (looksPdf && pdfView == IntPtr.Zero) { pdfView = h; pdfDetail = $"PDF({c} '{title}')"; }
+            return true;
+        }, IntPtr.Zero);
+
+        // 标题兜底：WPS 的顶层标题就是当前活动标签的文件名，带扩展名
+        var topSb = new StringBuilder(512);
+        GetWindowTextW(top, topSb, 512);
+        var topTitle = topSb.ToString();
+        var titlePdf = topTitle.TrimEnd().EndsWith(".pdf", StringComparison.OrdinalIgnoreCase);
+        var titleWord = topTitle.TrimEnd().EndsWith(".docx", StringComparison.OrdinalIgnoreCase)
+                     || topTitle.TrimEnd().EndsWith(".doc", StringComparison.OrdinalIgnoreCase);
+
+        if (pdfView != IntPtr.Zero && wordView == IntPtr.Zero) { detail = pdfDetail; return DocKind.Pdf; }
+        if (wordView != IntPtr.Zero && pdfView == IntPtr.Zero) { detail = wordDetail; return DocKind.Word; }
+        if (titlePdf && wordView == IntPtr.Zero) { detail = $"PDF(标题 '{topTitle}')"; return DocKind.Pdf; }
+        if (titleWord && pdfView == IntPtr.Zero) { detail = $"docx(标题 '{topTitle}')"; return DocKind.Word; }
+
+        // 两个视图都可见（切标签的瞬间）或都不可见：以标题为准，标题也看不出来就算其它
+        if (titlePdf) { detail = $"PDF(标题 '{topTitle}')"; return DocKind.Pdf; }
+        if (titleWord) { detail = $"docx(标题 '{topTitle}')"; return DocKind.Word; }
+        detail = $"其它('{topTitle}')";
+        return DocKind.Other;
+    }
+
+    /// <summary>当前有没有"正在显示 docx/doc 或 PDF"的 WPS 窗口（显示插件按钮、注册热键用这个）。</summary>
+    public static bool DocPresent(out DocKind kind, out string diag)
+    {
+        var h = Find(out diag);
+        kind = KindOf(h, out _);   // 诊断串里 Find 已经带了类型说明，这里不重复
+        return h != IntPtr.Zero && (kind == DocKind.Word || kind == DocKind.Pdf);
     }
 
     /// <summary>找当前文档子窗口和窗口中心点（物理屏幕坐标）。给 COM 测量和滚轮下发共用。</summary>
